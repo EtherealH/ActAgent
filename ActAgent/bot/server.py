@@ -3,25 +3,26 @@ import re
 from fastapi import FastAPI,WebSocket,WebSocketDisconnect
 from langchain_core.tools import Tool,tool
 from pydantic import BaseModel
-
+from langchain.utilities import SerpAPIWrapper
 from utils.LLMUtil import LocalLLM
-from langchain.agents import create_openai_tools_agent,AgentExecutor
+from langchain.agents import initialize_agent,AgentType
 from langchain_core.prompts import ChatPromptTemplate,MessagesPlaceholder
 from langchain.schema import StrOutputParser
-import requests
+import os
 app = FastAPI()
-
+os.environ["SERPAPI_API_KEY"] = "95ac0e518f8e578cc81b149144efd7535d5d7ccab87244e946a1cf3bb14ef3e7"
 class ChatRequest(BaseModel):
     query: str
 
 @tool
-def test():
-    """返回字符串 'test'"""
-    return "test"
+def search(query:str):
+    """只有需要了解实时情况或者不知道的事情时使用这个工具"""
+    serp = SerpAPIWrapper()
+    return serp.run(query)
 
-test_tool = Tool(
-    name="test",
-    func=test,
+serach_tool = Tool(
+    name="search",
+    func=search,
     description="返回字符串 'test'"
 )
 class Master:
@@ -60,15 +61,21 @@ class Master:
             ]
         )
         self.memory = ""
-        #tools = [test_tool]
-        # agent = create_openai_tools_agent(llm=self.chatModel,prompt=self.prompt,tools=tools)
+        self.tools = [serach_tool]
+        # agent = create_openai_tools_agent(self.chatModel,prompt=self.prompt,tools=tools)
         # self.agent_executor = AgentExecutor(agent,tools)
+        self.agent_executor = initialize_agent(
+            tools = self.tools,
+            llm = self.chatModel,
+            agent=AgentType.OPENAI_FUNCTIONS,
+            verbose = True
+        )
     def run(self,query):
         emotion_result = self.emotion_chain(query)
         print("当前用户情绪:",emotion_result)
         #获取当前用户情绪
         self.emotin = emotion_result
-        result = self.chatModel.invoke(query)
+        result = self.agent_executor.run(query)
         return result
 
     def emotion_chain(self,query:str):
@@ -104,8 +111,8 @@ def chat(request: ChatRequest):
     master = Master()
     content = master.run(request.query)
     #去掉特殊符号
-    cleaned_content = re.sub(r'<think>|</think>|\n', '', content)
-    return cleaned_content
+    # cleaned_content = re.sub(r'<think>|</think>|\n', '', content)
+    return content
 
 @app.post("/addUrls")
 def add_urls():
