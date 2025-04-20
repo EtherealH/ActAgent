@@ -1,6 +1,7 @@
 import re
 
 from fastapi import FastAPI,WebSocket,WebSocketDisconnect
+from langchain_core.messages import AIMessage
 from langchain_core.tools import Tool,tool
 from pydantic import BaseModel
 from langchain.utilities import SerpAPIWrapper
@@ -8,6 +9,13 @@ from utils.LLMUtil import LocalLLM
 from langchain.agents import initialize_agent,AgentType
 from langchain_core.prompts import ChatPromptTemplate,MessagesPlaceholder
 from langchain.schema import StrOutputParser
+from langchain.memory import ConversationTokenBufferMemory
+from langchain_community.chat_message_histories import RedisChatMessageHistory
+from langchain_community.document_loaders import WebBaseLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from sentence_transformers import SentenceTransformer
+from langchain.embeddings.base import Embeddings
 import os
 app = FastAPI()
 os.environ["SERPAPI_API_KEY"] = "95ac0e518f8e578cc81b149144efd7535d5d7ccab87244e946a1cf3bb14ef3e7"
@@ -19,11 +27,24 @@ def search(query:str):
     """只有需要了解实时情况或者不知道的事情时使用这个工具"""
     serp = SerpAPIWrapper()
     return serp.run(query)
-
+@tool
+def get_info_from_local_db(query:str):
+    """只能回答与2025年投资形式相关的问题，使用这个工具"""
+    embedding_model = LocalEmbedding('sentence-transformers/all-MiniLM-L6-v2')
+    db = Chroma(persist_directory="./chroma_db", embedding_function=embedding_model)
+    docs = db.similarity_search(query, k=3)
+    for doc in docs:
+        print(doc.page_content)
+    return docs
 serach_tool = Tool(
     name="search",
     func=search,
     description="返回字符串 'test'"
+)
+local_db_tool = Tool(
+    name="get_info_from_local_db",
+    func=get_info_from_local_db,
+    description="返回知识库答案"
 )
 class Master:
     def __init__(self):
@@ -54,22 +75,56 @@ class Master:
                 (
                     "system",self.SYSTEMPL.format(who_you_are=self.MOODS[self.emotin]["roleSet"])
                 ),
+                MessagesPlaceholder(variable_name=self.MEMORY_KEY),
                 (
                     "user","{query}"
                 ),
                 MessagesPlaceholder(variable_name="agent_scratchpad")
             ]
         )
-        self.memory = ""
-        self.tools = [serach_tool]
+        self.memory = self.get_memory()
+        self.tools = [serach_tool,local_db_tool]
         # agent = create_openai_tools_agent(self.chatModel,prompt=self.prompt,tools=tools)
         # self.agent_executor = AgentExecutor(agent,tools)
+        memory = ConversationTokenBufferMemory(
+            llm = self.chatModel,
+            human_prefix = "User",
+            ai_prefix = "陈经理",
+            memory_key = self.MEMORY_KEY,
+            output_key = "output",
+            return_messages =True,
+            max_token_limit = 1000,
+            chat_memory = self.memory,
+        )
         self.agent_executor = initialize_agent(
             tools = self.tools,
             llm = self.chatModel,
+            memory = memory,
             agent=AgentType.OPENAI_FUNCTIONS,
             verbose = True
         )
+    def get_memory(self):
+        chat_message_history = RedisChatMessageHistory(
+            url = "redis://localhost:6379/0",
+            session_id="session"
+        )
+        print("chat_message_history:",chat_message_history.messages)
+        store_message = chat_message_history.messages
+        if len(store_message) > 10:
+            prompt =ChatPromptTemplate.from_messages(
+                [
+                    ("system",self.SYSTEMPL+"\n这是一段你和用户的对话记忆，对其进行总结摘要，摘要使用第一人称'我'，并且提取其中用户关键信息，如姓名、投资经历，可用投资资产等\n例如：用户user1问我，我礼貌回复"
+                                            "然后他问我今年投资什么能赚钱，我回复他今年的投资情况，然后他离开。|user1,10年，50万"),
+                    ("user",f"{input}"),
+                ]
+            )
+            chain = prompt | self.chatModel | StrOutputParser()
+            summary = chain.invoke({"input":store_message,"who_you_are":self.MOODS[self.emotin]["roleSet"]})
+            print("summary:",summary)
+            chat_message_history.clear()
+            chat_message_history.add_message(AIMessage(content=summary))
+        return chat_message_history
+
     def run(self,query):
         emotion_result = self.emotion_chain(query)
         print("当前用户情绪:",emotion_result)
@@ -97,8 +152,28 @@ class Master:
 
         result = chain.invoke(input_data)
         return result
+#构建embedding类
+class LocalEmbedding(Embeddings):
+    def __init__(self, model_name):
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(model_name)
 
-
+    # 实现 embed_documents 方法
+    def embed_documents(self, texts):
+        # 检查传入的 texts 是否为字符串列表
+        # if not isinstance(texts, list) or not all(isinstance(text, Document) for text in texts):
+        #     raise ValueError("Input must be a list of strings.")
+        # 使用模型进行嵌入
+        embeddings = []
+        for text in texts:
+            try:
+                # 对文本进行嵌入
+                embedding = self.model.encode(text)
+                embeddings.append(embedding.tolist())
+            except Exception as e:
+                print(f"Error encoding text: {text}, Error: {e}")
+                embeddings.append(None)  # 可以选择添加 None 或者处理错误
+        return embeddings
 
 @app.get("/")
 def read_root():
@@ -115,8 +190,26 @@ def chat(request: ChatRequest):
     return content
 
 @app.post("/addUrls")
-def add_urls():
-    return {"response:  "}
+def add_urls(URL:str):
+    loader =WebBaseLoader(URL)
+    docs = loader.load()
+    docments = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=50
+    ).split_documents(docs)
+    #引入向量数据库
+    embedding_model = LocalEmbedding('sentence-transformers/all-MiniLM-L6-v2')
+    # 生成嵌入
+    embeddings = embedding_model.embed_documents(docments)
+    if not embeddings or len(embeddings) != len(docments):
+        raise ValueError("Mismatch between document count and embedding count.")
+    # 使用 Chroma 存储这些向量
+    db = Chroma.from_texts(
+        texts=docments,  # 文档列表
+        embedding=embedding_model  # 传入自定义的嵌入模型
+    )
+    print("向量数据库创建完成")
+    return {"response:  ok"}
 
 
 
