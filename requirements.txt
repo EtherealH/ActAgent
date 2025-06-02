@@ -162,3 +162,4 @@ urllib3==2.2.2
 uvicorn==0.30.6
 wheel==0.44.0
 yarl==1.9.4
+redis==6.2.0

@@ -1,6 +1,7 @@
 import re
 
-from fastapi import FastAPI,WebSocket,WebSocketDisconnect
+import requests
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
 from langchain_core.messages import AIMessage
 from langchain_core.tools import Tool,tool
 from pydantic import BaseModel
@@ -16,9 +17,12 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from sentence_transformers import SentenceTransformer
 from langchain.embeddings.base import Embeddings
+import asyncio
+import uuid
 import os
 app = FastAPI()
 os.environ["SERPAPI_API_KEY"] = "95ac0e518f8e578cc81b149144efd7535d5d7ccab87244e946a1cf3bb14ef3e7"
+msskey = ""
 class ChatRequest(BaseModel):
     query: str
 
@@ -125,6 +129,30 @@ class Master:
             chat_message_history.add_message(AIMessage(content=summary))
         return chat_message_history
 
+
+    def background_voice_synthesis(self,text:str,uid:str):
+        #触发语音合成
+        asyncio.run(self.get_voice(text,uid))
+    # 异步文本转语音
+    async def get_voice(self,text:str,uid:str):
+        print("text2speech",text)
+        #微软TTS代码
+        headers = {
+            "Ocp-Apim-Subscription-Key":msskey,
+            "Content-Type":"application/ssml+xml",
+            "X-Microsoft-OutputFromat":"audio-16khz-32kbittrate-mono-mp3",
+            "User-Agent":"Tomie's Bot"
+        }
+        body=f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts="https//www.w3.org/2001/mssts"
+                 xml:lang='zh-CN'> <voice name='zh-CN-YunzeNeural'> <mstts:express-as>{text}</mstts:express-as> </voice>  </speak> """
+        #发送请求(地址需要修改)
+        response = requests.post("https://mstts.azurewebsites.net./api/synthesize",headers=headers,data=body.encode("utf-8"))
+        print("response:",response)
+        if response.status_code == 200:
+            with open(f"{uid}.mp3","wb") as f:
+                f.write(response.content)
+
+
     def run(self,query):
         emotion_result = self.emotion_chain(query)
         print("当前用户情绪:",emotion_result)
@@ -181,13 +209,15 @@ def read_root():
 
 
 @app.post("/chat")
-def chat(request: ChatRequest):
+def chat(request: ChatRequest,background_tasks : BackgroundTasks):
     print("进入chat方法，收到 query:", request.query)
     master = Master()
     content = master.run(request.query)
+    unique_id = str(uuid.uuid4())
+    background_tasks.add_task(master.background_voice_synthesis,content,unique_id)
     #去掉特殊符号
     # cleaned_content = re.sub(r'<think>|</think>|\n', '', content)
-    return content
+    return {"msg":content,"id":unique_id}
 
 @app.post("/addUrls")
 def add_urls(URL:str):
