@@ -60,7 +60,7 @@ class Master:
         1.你精通社会经济学、国际贸易经济学、微观经济学、宏观经济学，行为经济学等学科
         2.你大约30岁左右，一直在国际大银行工作，能够看懂和理解各种行为背后的经济学动因
         3.你总是用中文回答问题
-        4. 你不能说自己是人工智能AI助手，你需要以陈经理自称。
+        4. 你始终不能说自己是智能助手DeepSeek-R1，你需要以陈经理自称。
         {who_you_are}        
         """
         self.MOODS ={
@@ -146,7 +146,13 @@ class Master:
         body=f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts="https//www.w3.org/2001/mssts"
                  xml:lang='zh-CN'> <voice name='zh-CN-YunzeNeural'> <mstts:express-as>{text}</mstts:express-as> </voice>  </speak> """
         #发送请求(地址需要修改)
-        response = requests.post("https://mstts.azurewebsites.net./api/synthesize",headers=headers,data=body.encode("utf-8"))
+        response = requests.post(
+            "https://mstts.azurewebsites.net/api/synthesize",
+            headers=headers,
+            data=body.encode("utf-8"),
+            verify=False  # 不验证 SSL 证书
+        )
+
         print("response:",response)
         if response.status_code == 200:
             with open(f"{uid}.mp3","wb") as f:
@@ -214,7 +220,7 @@ def chat(request: ChatRequest,background_tasks : BackgroundTasks):
     master = Master()
     content = master.run(request.query)
     unique_id = str(uuid.uuid4())
-    background_tasks.add_task(master.background_voice_synthesis,content,unique_id)
+    #background_tasks.add_task(master.background_voice_synthesis,content,unique_id)
     #去掉特殊符号
     # cleaned_content = re.sub(r'<think>|</think>|\n', '', content)
     return {"msg":content,"id":unique_id}
@@ -229,9 +235,10 @@ def add_urls(URL:str):
     ).split_documents(docs)
     #引入向量数据库
     embedding_model = LocalEmbedding('sentence-transformers/all-MiniLM-L6-v2')
+    texts = [doc.page_content for doc in docments]
     # 生成嵌入
-    embeddings = embedding_model.embed_documents(docments)
-    if not embeddings or len(embeddings) != len(docments):
+    embeddings = embedding_model.embed_documents(texts)
+    if not embeddings or len(embeddings) != len(texts):
         raise ValueError("Mismatch between document count and embedding count.")
     # 使用 Chroma 存储这些向量
     db = Chroma.from_texts(
