@@ -1,4 +1,5 @@
 import re
+import json
 
 import requests
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
@@ -546,4 +547,191 @@ async def websocket_endPoint(websocket: WebSocket):
     except WebSocketDisconnect:
         print("Connection closed")
         await websocket.close()
+
+# 微信小程序WebSocket端点
+@app.websocket("/wechat/ws")
+async def wechat_websocket(websocket: WebSocket):
+    """
+    微信小程序WebSocket连接端点
+    支持的消息类型：
+    1. login: 登录消息 {"type": "login", "code": "微信code"}
+    2. chat: 聊天消息 {"type": "chat", "query": "用户消息", "use_auto_rag": false}
+    3. ping: 心跳消息 {"type": "ping"}
+    """
+    await websocket.accept()
+    openid = None
+    session_id = None
+    
+    try:
+        # 发送连接成功消息
+        await websocket.send_json({
+            "type": "connected",
+            "code": 0,
+            "message": "连接成功",
+            "data": None
+        })
+        
+        while True:
+            # 接收消息
+            try:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                await websocket.send_json({
+                    "type": "error",
+                    "code": 400,
+                    "message": "消息格式错误，需要JSON格式",
+                    "data": None
+                })
+                continue
+            
+            msg_type = message.get("type")
+            
+            # 处理登录消息
+            if msg_type == "login":
+                try:
+                    code = message.get("code")
+                    if not code:
+                        await websocket.send_json({
+                            "type": "login_response",
+                            "code": 400,
+                            "message": "缺少code参数",
+                            "data": None
+                        })
+                        continue
+                    
+                    # 调用微信API获取openid
+                    result = wechat_api.code2session(code)
+                    openid = result.get("openid")
+                    session_id = openid if openid else "default"
+                    
+                    await websocket.send_json({
+                        "type": "login_response",
+                        "code": 0,
+                        "message": "登录成功",
+                        "data": {
+                            "openid": openid,
+                            "unionid": result.get("unionid"),
+                            "session_id": session_id
+                        }
+                    })
+                except HTTPException as e:
+                    await websocket.send_json({
+                        "type": "login_response",
+                        "code": e.status_code,
+                        "message": e.detail,
+                        "data": None
+                    })
+                except Exception as e:
+                    await websocket.send_json({
+                        "type": "login_response",
+                        "code": 500,
+                        "message": f"登录失败: {str(e)}",
+                        "data": None
+                    })
+            
+            # 处理聊天消息
+            elif msg_type == "chat":
+                if not openid:
+                    await websocket.send_json({
+                        "type": "chat_response",
+                        "code": 401,
+                        "message": "请先登录",
+                        "data": None
+                    })
+                    continue
+                
+                try:
+                    query = message.get("query")
+                    if not query:
+                        await websocket.send_json({
+                            "type": "chat_response",
+                            "code": 400,
+                            "message": "缺少query参数",
+                            "data": None
+                        })
+                        continue
+                    
+                    use_auto_rag = message.get("use_auto_rag", False)
+                    
+                    # 发送处理中消息
+                    await websocket.send_json({
+                        "type": "chat_processing",
+                        "code": 0,
+                        "message": "正在处理中...",
+                        "data": None
+                    })
+                    
+                    # 在线程池中运行同步的Master.run()方法
+                    import concurrent.futures
+                    loop = asyncio.get_event_loop()
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        master = Master()
+                        # 如果需要在Redis中使用openid作为session_id，可以修改Master类
+                        # 这里先使用默认的session_id
+                        content = await loop.run_in_executor(
+                            executor,
+                            master.run,
+                            query,
+                            use_auto_rag
+                        )
+                    
+                    unique_id = str(uuid.uuid4())
+                    
+                    # 发送回复消息
+                    await websocket.send_json({
+                        "type": "chat_response",
+                        "code": 0,
+                        "message": "成功",
+                        "data": {
+                            "msg": content,
+                            "id": unique_id,
+                            "session_id": session_id
+                        }
+                    })
+                except Exception as e:
+                    print(f"微信小程序WebSocket聊天处理错误: {e}")
+                    await websocket.send_json({
+                        "type": "chat_response",
+                        "code": 500,
+                        "message": f"处理失败: {str(e)}",
+                        "data": None
+                    })
+            
+            # 处理心跳消息
+            elif msg_type == "ping":
+                await websocket.send_json({
+                    "type": "pong",
+                    "code": 0,
+                    "message": "pong",
+                    "data": None
+                })
+            
+            # 未知消息类型
+            else:
+                await websocket.send_json({
+                    "type": "error",
+                    "code": 400,
+                    "message": f"未知的消息类型: {msg_type}",
+                    "data": None
+                })
+    
+    except WebSocketDisconnect:
+        print(f"微信小程序WebSocket连接断开 - openid: {openid}")
+    except Exception as e:
+        print(f"微信小程序WebSocket错误: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "code": 500,
+                "message": f"服务器错误: {str(e)}",
+                "data": None
+            })
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
 
